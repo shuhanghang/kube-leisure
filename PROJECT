@@ -1,0 +1,16 @@
+domain: shuhanghang.com
+layout:
+- go.kubebuilder.io/v3
+projectName: kube-leisure
+repo: github.com/shuhanghang/kube-leisure
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: shuhanghang.com
+  group: leisure
+  kind: Leisure
+  path: github.com/shuhanghang/kube-leisure/api/v1beta1
+  version: v1beta1
+version: "3"

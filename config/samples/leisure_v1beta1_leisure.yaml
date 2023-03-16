@@ -1,0 +1,23 @@
+apiVersion: leisure.shuhanghang.com/v1beta1
+kind: Leisure
+metadata:
+  name: leisure-sample
+spec:
+  restart:
+    resourceType: deployment
+    name: nginx
+    nameSpace: default
+    restartAt: '*/2 * * * *'
+    timeZone: Asia/Shanghai
+--- 
+apiVersion: leisure.shuhanghang.com/v1beta1
+kind: Leisure
+metadata:
+  name: leisure-sample2
+spec:
+  restart:
+    resourceType: statefulset
+    name: postgresql
+    nameSpace: default
+    restartAt: '*/3 * * * *'
+    timeZone: Asia/Shanghai

@@ -4,7 +4,7 @@
 ## 开始
 1. 安装
 ```sh
-    kubectl apply -f 
+    kubectl apply -f https://raw.githubusercontent.com/shuhanghang/kube-leisure/master/deployment/leisure-crd-rbac.yaml
 ```
 2. 部署自定义`重启负载`文件
 ```yaml

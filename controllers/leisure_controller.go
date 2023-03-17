@@ -28,37 +28,37 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	"github.com/go-logr/logr"
 	"github.com/robfig/cron/v3"
 	leisurev1beta1 "github.com/shuhanghang/kube-leisure/api/v1beta1"
+	"go.uber.org/zap"
 )
 
 var MyCrontab = cron.New()
 
-var MyCronCache = map[string]map[string]cron.EntryID{}
+var MyCronCache = map[string]JobSchema{}
 
 // LeisureReconciler reconciles a Leisure object
 type LeisureReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-	log    logr.Logger
+	log    *zap.Logger
 }
 
-type RestartGroup struct {
-	Name    string
-	Req     ctrl.Request
-	ObjMeta RestartObjMeta
+type JobGroup struct {
+	Name string
+	Req  ctrl.Request
+	Job  JobSchema
 }
 
-type RestartObjMeta struct {
+type JobSchema struct {
 	Name      string
 	NameSpace string
 	Crontab   string
 	Type      string
-	Id        string
+	Id        cron.EntryID
+	UID       string
 }
 
 type CronJobsCache map[string]map[string]int32
@@ -69,8 +69,8 @@ type CronJobCache map[string]int32
 //+kubebuilder:rbac:groups=leisure.shuhanghang.com,resources=leisures/finalizers,verbs=update
 
 func (r *LeisureReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	r.log = log.FromContext(ctx)
-	var restartGroup = RestartGroup{
+	r.log, _ = zap.NewDevelopment()
+	var JobGroup = JobGroup{
 		Name: req.NamespacedName.String(),
 		Req:  req,
 	}
@@ -79,12 +79,13 @@ func (r *LeisureReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	err := r.Get(context.TODO(), req.NamespacedName, &leisureRestart)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			if !reflect.DeepEqual(MyCronCache[restartGroup.Name], CronJobCache{}) {
-				jobs := MyCronCache[restartGroup.Name]
-				for _, job := range jobs {
-					MyCrontab.Remove(job)
-					r.log.Info("The job has been deleted", "CronID", job, "Lens of crontab entries", len(MyCrontab.Entries()))
+			if !reflect.DeepEqual(MyCronCache[JobGroup.Name], CronJobCache{}) {
+				job := MyCronCache[JobGroup.Name]
+				if job.Id != 0 {
+					MyCrontab.Remove(job.Id)
+					r.log.Sugar().Infof("The job has been deleted, JobID: %v, Lens of crontab entries: %v, Job: %#v", job.Id, len(MyCrontab.Entries()), job)
 				}
+
 			} else {
 				r.log.Info("Not found leisure object, it may be removed")
 			}
@@ -92,39 +93,38 @@ func (r *LeisureReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	restartObj := RestartObjMeta{
+	Job := JobSchema{
 		Name:      leisureRestart.Spec.Restart.Name,
 		NameSpace: leisureRestart.Spec.Restart.NameSpace,
 		Crontab:   "CRON_TZ=" + leisureRestart.Spec.Restart.TimeZone + " " + leisureRestart.Spec.Restart.RestartAt,
 		Type:      leisureRestart.Spec.Restart.ResourceType,
 	}
 
-	restartObj.Id = restartObj.Type + "-" + restartObj.Name + "-" + restartObj.NameSpace
-
-	restartGroup.ObjMeta = restartObj
+	Job.UID = string(leisureRestart.UID)
+	JobGroup.Job = Job
 
 	// Delete job
-	if !reflect.DeepEqual(MyCronCache[restartGroup.Name], CronJobCache{}) {
-		jobId, found := MyCronCache[restartGroup.Name][restartGroup.ObjMeta.Id]
-		if found {
+	if !reflect.DeepEqual(MyCronCache[JobGroup.Name], CronJobCache{}) {
+		jobId := MyCronCache[JobGroup.Name].Id
+		if jobId != 0 {
 			MyCrontab.Remove(jobId)
-			r.log.Info("The job has been deleted", "CronID", restartGroup.Name, "Lens of cron entries", len(MyCrontab.Entries()))
+			r.log.Sugar().Infof("The job has been deleted, JobID: %v, Lens of cron entries: %v, Job: %#v", jobId, len(MyCrontab.Entries()), JobGroup.Job)
 		}
-
-		r.log.Info("Restart job has been checked", "JobMeta", restartGroup.ObjMeta)
+		r.log.Sugar().Infof("Restart job has been checked, Job: %v", JobGroup.Name)
 	}
 
 	// Add job
-	if restartGroup.ObjMeta.Type == "deployment" {
-		ei, _ := MyCrontab.AddFunc(restartGroup.ObjMeta.Crontab, func() { r.AddRolloutRestartDeploy(restartGroup) })
-		MyCronCache[restartGroup.Name] = map[string]cron.EntryID{restartGroup.ObjMeta.Id: ei}
-		r.log.Info("Launch the job and set cronId to cronCache", "CronID", ei)
+	if JobGroup.Job.Type == "deployment" {
+		ei, _ := MyCrontab.AddFunc(JobGroup.Job.Crontab, func() { r.AddRolloutRestartDeploy(JobGroup) })
+		JobGroup.Job.Id = ei
+		MyCronCache[JobGroup.Name] = JobGroup.Job
+		r.log.Sugar().Infof("Launch the job and set cronId to cronCache, JobID: %v, Lens of cron entries: %v, Job: %#v", ei, len(MyCrontab.Entries()), JobGroup.Job)
 
-	} else if restartGroup.ObjMeta.Type == "statefulset" {
-		ei, _ := MyCrontab.AddFunc(restartGroup.ObjMeta.Crontab, func() { r.AddRolloutRestartStatefulset(restartGroup) })
-		MyCronCache[restartGroup.Name] = map[string]cron.EntryID{restartGroup.ObjMeta.Id: ei}
-		r.log.Info("Launch the job and set cronId to cronCache", "CronID", ei)
-
+	} else if JobGroup.Job.Type == "statefulset" {
+		ei, _ := MyCrontab.AddFunc(JobGroup.Job.Crontab, func() { r.AddRolloutRestartStatefulset(JobGroup) })
+		JobGroup.Job.Id = ei
+		MyCronCache[JobGroup.Name] = JobGroup.Job
+		r.log.Sugar().Infof("Launch the job and set cronId to cronCache, JobID: %v, Lens of cron entries: %v, Job: %#v", ei, len(MyCrontab.Entries()), JobGroup.Job)
 	}
 
 	return ctrl.Result{}, nil
@@ -139,18 +139,19 @@ func (r *LeisureReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *LeisureReconciler) AddRolloutRestartDeploy(restartDep RestartGroup) {
+func (r *LeisureReconciler) AddRolloutRestartDeploy(restartDep JobGroup) {
 	dep := appsv1.Deployment{}
 	specDeployment := types.NamespacedName{
-		Name:      restartDep.ObjMeta.Name,
-		Namespace: restartDep.ObjMeta.NameSpace,
+		Name:      restartDep.Job.Name,
+		Namespace: restartDep.Job.NameSpace,
 	}
 	err := r.Get(context.TODO(), specDeployment, &dep)
 	if err != nil {
-		r.log.Error(err, "error to get the deployment", "deployment", specDeployment)
+		r.log.Sugar().Errorf("error to get the deployment, deployment: %v, error: %v", specDeployment, err.Error())
+		return
 	}
 	if reflect.DeepEqual(dep, appsv1.Deployment{}) {
-		r.log.Info("Not found the deployment", "CrdName", specDeployment.Name, "CrdNameSpace", specDeployment.Namespace)
+		r.log.Sugar().Infof("Not found the deployment, JobName: %v, JobNameSpace: %v", specDeployment.Name, specDeployment.Namespace)
 		return
 	}
 	patch := client.MergeFrom(dep.DeepCopy())
@@ -159,24 +160,26 @@ func (r *LeisureReconciler) AddRolloutRestartDeploy(restartDep RestartGroup) {
 	dep.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = restartAt
 	err = r.Patch(context.TODO(), &dep, patch)
 	if err != nil {
-		r.log.Error(err, "error to restart the Deployment", "deployment", specDeployment)
+		r.log.Sugar().Errorf("error to restart the Deployment, deployment: %v", specDeployment)
+		return
 	}
 	r.UpdateStatus(restartDep)
-	r.log.Info("Deployment has being restarted", "RestartAt", restartAt, "NextAt", GetJobNextAt(restartDep), "RestartObj", specDeployment)
+	r.log.Sugar().Infof("Deployment has being restarted, RestartAt: %v, NextAt: %v, Job: %v", restartAt, restartDep, specDeployment)
 }
 
-func (r *LeisureReconciler) AddRolloutRestartStatefulset(restartState RestartGroup) {
+func (r *LeisureReconciler) AddRolloutRestartStatefulset(restartState JobGroup) {
 	dep := appsv1.StatefulSet{}
 	specStatefulset := types.NamespacedName{
-		Name:      restartState.ObjMeta.Name,
-		Namespace: restartState.ObjMeta.NameSpace,
+		Name:      restartState.Job.Name,
+		Namespace: restartState.Job.NameSpace,
 	}
 	err := r.Get(context.TODO(), specStatefulset, &dep)
 	if err != nil {
-		r.log.Error(err, "error to get the StatefulSet", "StatefulSet", specStatefulset)
+		r.log.Sugar().Errorf("error to get the StatefulSet, StatefulSet: %v", specStatefulset)
+		return
 	}
 	if reflect.DeepEqual(dep, appsv1.StatefulSet{}) {
-		r.log.Info("Not found the statefulset", "CrdName", specStatefulset.Name, "CrdNameSpace", specStatefulset.Namespace)
+		r.log.Sugar().Infof("Not found the statefulset, JobName: %v, JobNameSpace: %v", specStatefulset, specStatefulset.Namespace)
 		return
 	}
 	patch := client.MergeFrom(dep.DeepCopy())
@@ -185,27 +188,28 @@ func (r *LeisureReconciler) AddRolloutRestartStatefulset(restartState RestartGro
 	dep.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = restartAt
 	err = r.Patch(context.TODO(), &dep, patch)
 	if err != nil {
-		r.log.Error(err, "error to restart the StatefulSet", "StatefulSet", specStatefulset)
+		r.log.Sugar().Errorf("error to restart the StatefuleSet, StatefulSet: %#v", specStatefulset)
+		return
 	}
 	r.UpdateStatus(restartState)
-	r.log.Info("Statefuleset has being restarted", "RestartAt", restartAt, "NextAt", GetJobNextAt(restartState), "RestartObj", specStatefulset)
+	r.log.Sugar().Infof("StatefulSet has being restartted, RestartAt: %v, NextAt: %v, Job: %#v", restartAt, GetJobNextAt(restartState), specStatefulset)
 
 }
 
 // Update Status
-func (r *LeisureReconciler) UpdateStatus(restartObj RestartGroup) {
+func (r *LeisureReconciler) UpdateStatus(Job JobGroup) {
 	leisure := leisurev1beta1.Leisure{}
-	err := r.Get(context.TODO(), restartObj.Req.NamespacedName, &leisure)
+	err := r.Get(context.TODO(), Job.Req.NamespacedName, &leisure)
 	if err == nil {
-		leisure.Status.NextAt = GetJobNextAt(restartObj)
+		leisure.Status.NextAt = GetJobNextAt(Job)
 		r.Status().Update(context.TODO(), &leisure)
 	}
 }
 
 // Get job Next time
-func GetJobNextAt(restartObj RestartGroup) string {
-	jobId, found := MyCronCache[restartObj.Name][restartObj.ObjMeta.Id]
-	if found {
+func GetJobNextAt(Job JobGroup) string {
+	jobId := MyCronCache[Job.Name].Id
+	if jobId != 0 {
 		for _, jobEntry := range MyCrontab.Entries() {
 			if jobEntry.ID == jobId {
 				return jobEntry.Next.String()
